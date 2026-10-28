@@ -215,6 +215,10 @@ class Conversation(Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     title: Mapped[str] = mapped_column(String(200))
+    # Running summary of the turns older than the verbatim history window, and how many
+    # messages (oldest first) it covers.
+    summary: Mapped[str | None] = mapped_column(Text)
+    summarized_messages: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -262,6 +266,8 @@ class QueryLog(Base):
         ForeignKey("messages.id", ondelete="SET NULL")
     )
     query: Mapped[str] = mapped_column(Text)
+    rewritten_query: Mapped[str | None] = mapped_column(Text)  # what retrieval actually used
+    request_id: Mapped[str | None] = mapped_column(String(64))
     retrieved_chunk_ids: Mapped[list[str]] = mapped_column(JSONType, default=list)
     context_chunk_ids: Mapped[list[str]] = mapped_column(JSONType, default=list)
     latency_ms: Mapped[dict[str, float]] = mapped_column(JSONType, default=dict)

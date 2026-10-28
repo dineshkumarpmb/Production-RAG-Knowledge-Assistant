@@ -22,6 +22,7 @@ x-settings: &settings
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   LLM_MODEL: ${LLM_MODEL:-claude-opus-5-5}
   LLM_EFFORT: ${LLM_EFFORT:-medium}
+  LLM_HELPER_MODEL: ${LLM_HELPER_MODEL:-claude-haiku-5-5}  # rewrites follow-ups, summarises
 
 x-backend: &backend
   <<: *image

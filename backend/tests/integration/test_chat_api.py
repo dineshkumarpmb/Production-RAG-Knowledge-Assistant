@@ -201,7 +201,12 @@ async def test_nothing_found_answers_without_calling_the_llm(
     events = await ask(client, conversation_id, "Are dogs allowed in the office?")
 
     assert [name for name, _ in events] == ["sources", "delta", "done"]
-    assert events[0][1] == {"sources": [], "not_found": True, "degraded": []}
+    assert events[0][1] == {
+        "sources": [],
+        "not_found": True,
+        "degraded": [],
+        "search_query": "Are dogs allowed in the office?",
+    }
     assert events[1][1] == {"text": NOT_FOUND_ANSWER}
     assert events[-1][1]["not_found"] is True
     assert answer_generator.calls == []
@@ -221,7 +226,9 @@ async def test_llm_failure_streams_an_error_and_keeps_the_partial_answer(
     events = await ask(client, conversation_id, "What is the hotel limit?")
 
     assert [name for name, _ in events] == ["sources", "delta", "error"]
-    assert events[-1][1] == {
+    error = events[-1][1]
+    assert error.pop("request_id")  # also in the logs and the query log, for support
+    assert error == {
         "code": "llm_rate_limited",
         "message": "Too many requests.",
         "retryable": True,

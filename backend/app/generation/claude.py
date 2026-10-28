@@ -10,6 +10,7 @@
 """
 
 from collections.abc import AsyncIterator, Sequence
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 import anthropic
@@ -18,7 +19,12 @@ import structlog
 from app.core.config import Settings
 from app.generation.citations import CitationResolver
 from app.generation.pricing import usage_cost
-from app.generation.prompts import REFUSAL_ANSWER, SYSTEM_PROMPT, build_messages
+from app.generation.prompts import (
+    REFUSAL_ANSWER,
+    SYSTEM_PROMPT,
+    HistoryMessage,
+    build_messages,
+)
 from app.generation.types import (
     Citation,
     CitationAdded,
@@ -27,6 +33,7 @@ from app.generation.types import (
     Reset,
     Span,
     TextDelta,
+    UsageUpdate,
 )
 from app.retrieval.context import ContextBlock
 
@@ -82,11 +89,26 @@ def create_client(settings: Settings) -> anthropic.AsyncAnthropic:
     )
 
 
+def to_llm_error(exc: Exception) -> LLMError | None:
+    """The user-facing error for an SDK failure, or None if `exc` is not one (a real bug)."""
+    if isinstance(exc, anthropic.AnthropicError):
+        return map_error(exc)
+    # With no credentials at all the SDK raises a plain TypeError while building the request
+    # headers (seen in the Linux container).
+    if isinstance(exc, TypeError) and "authentication method" in str(exc):
+        return LLMError("llm_not_configured", "The Claude API key is not set.", retryable=False)
+    return None
+
+
 class AnswerGenerator(Protocol):
     model: str
 
     def stream(
-        self, question: str, blocks: Sequence[ContextBlock]
+        self,
+        question: str,
+        blocks: Sequence[ContextBlock],
+        history: Sequence[HistoryMessage] = (),
+        summary: str | None = None,
     ) -> AsyncIterator[GenerationEvent]: ...
 
 
@@ -95,6 +117,8 @@ class _AnswerState:
 
     def __init__(self, resolver: CitationResolver) -> None:
         self._resolver = resolver
+        self.model: str | None = None
+        self.usage: dict[str, int] = {}
         self.reset()
 
     def reset(self) -> None:
@@ -103,7 +127,18 @@ class _AnswerState:
         self.citations: list[Citation] = []
         self._citation_keys: dict[tuple[Any, ...], int] = {}
 
-    def on_event(self, event: Any) -> list[GenerationEvent]:
+    def on_event(self, event: Any) -> list[GenerationEvent] | dict[str, int]:
+        """Our events for one stream event; a dict when it only updated the token counts."""
+        if event.type == "message_start":
+            self.model = event.message.model
+            self.usage = _counts(event.message.usage)
+            return dict(self.usage)
+        if event.type == "message_delta" and getattr(event, "usage", None) is not None:
+            output = getattr(event.usage, "output_tokens", None)
+            if output is None:
+                return []
+            self.usage["output_tokens"] = output
+            return dict(self.usage)
         if event.type == "content_block_start":
             block = event.content_block
             if block.type == "text":
@@ -148,14 +183,20 @@ class ClaudeAnswerGenerator:
         self._settings = settings
         self.model = settings.llm_model
 
-    def request_params(self, question: str, blocks: Sequence[ContextBlock]) -> dict[str, Any]:
+    def request_params(
+        self,
+        question: str,
+        blocks: Sequence[ContextBlock],
+        history: Sequence[HistoryMessage] = (),
+        summary: str | None = None,
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self._settings.llm_max_tokens,
             "system": [
                 {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
             ],
-            "messages": build_messages(question, blocks),
+            "messages": build_messages(question, blocks, history, summary),
             "output_config": {"effort": self._settings.llm_effort},
         }
         if self._settings.llm_fallbacks:
@@ -164,28 +205,32 @@ class ClaudeAnswerGenerator:
         return params
 
     async def stream(
-        self, question: str, blocks: Sequence[ContextBlock]
+        self,
+        question: str,
+        blocks: Sequence[ContextBlock],
+        history: Sequence[HistoryMessage] = (),
+        summary: str | None = None,
     ) -> AsyncIterator[GenerationEvent]:
         state = _AnswerState(CitationResolver(blocks))
+        params = self.request_params(question, blocks, history, summary)
         try:
-            async with self._client.beta.messages.stream(
-                **self.request_params(question, blocks)
-            ) as stream:
+            async with self._client.beta.messages.stream(**params) as stream:
                 async for event in stream:
-                    for out in state.on_event(event):
+                    result = state.on_event(event)
+                    if isinstance(result, dict):
+                        model = state.model or self.model
+                        usage = usage_cost(_as_usage(result), model, self._settings.llm_prices)
+                        yield UsageUpdate(usage=usage, model=model)
+                        continue
+                    for out in result:
                         yield out
                 final = await stream.get_final_message()
-        except anthropic.AnthropicError as exc:
-            log.warning("generation.failed", error=type(exc).__name__, detail=str(exc)[:300])
-            raise map_error(exc) from exc
-        except TypeError as exc:
-            # With no credentials at all the SDK raises a plain TypeError while building the
-            # request headers (seen in the Linux container); anything else is a real bug.
-            if "authentication method" not in str(exc):
+        except (anthropic.AnthropicError, TypeError) as exc:
+            error = to_llm_error(exc)
+            if error is None:
                 raise
-            raise LLMError(
-                "llm_not_configured", "The Claude API key is not set.", retryable=False
-            ) from exc
+            log.warning("generation.failed", error=type(exc).__name__, detail=str(exc)[:300])
+            raise error from exc
         for out in self._finish(state, final):
             yield out
 
@@ -217,3 +262,19 @@ class ClaudeAnswerGenerator:
             )
         )
         return events
+
+
+_COUNT_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def _counts(usage: Any) -> dict[str, int]:
+    return {f: getattr(usage, f, 0) or 0 for f in _COUNT_FIELDS}
+
+
+def _as_usage(counts: dict[str, int]) -> Any:
+    return SimpleNamespace(**counts, iterations=None)

@@ -1,13 +1,17 @@
-"""The answer pipeline: retrieve -> (not found? answer without the LLM) -> stream a cited answer.
+"""The answer pipeline: (follow-up? rewrite it) -> retrieve -> (not found? answer without the
+LLM) -> stream a cited answer that sees recent turns and a summary of older ones.
 
 Yields `(event, payload)` pairs for Server-Sent Events, in this order:
 
-    sources   the passages the answer will be grounded in (sent before generation starts)
+    sources   the passages the answer will be grounded in (sent before generation starts),
+              and the search query used (the rewritten follow-up, when there was one)
     delta     a piece of answer text                                  (repeated)
     citation  a cited passage for the current stretch of text         (repeated)
     reset     discard text and citations so far (refusal / fallback)  (rare)
     done      the final answer: text, cited spans, citations, usage, cost, timings
     error     generation failed; `partial` says whether text was already streamed
+
+`done` and `error` carry the request ID, which also appears in logs and the query log.
 
 After iteration, `AnswerRun.outcome` holds everything needed to store the message and log.
 """
@@ -21,7 +25,8 @@ import structlog
 
 from app.db.access import Principal
 from app.generation.claude import AnswerGenerator, LLMError
-from app.generation.prompts import NOT_FOUND_ANSWER, source_title
+from app.generation.conversation import ConversationHelper
+from app.generation.prompts import NOT_FOUND_ANSWER, HistoryMessage, source_title
 from app.generation.types import (
     Citation,
     CitationAdded,
@@ -30,6 +35,7 @@ from app.generation.types import (
     Span,
     TextDelta,
     Usage,
+    UsageUpdate,
 )
 from app.retrieval.context import ContextBlock
 from app.retrieval.service import HybridRetriever
@@ -43,6 +49,12 @@ Event = tuple[str, dict[str, Any]]
 @dataclass
 class AnswerOutcome:
     question: str
+    search_query: str = ""  # what retrieval used: the rewritten follow-up, or the question
+    request_id: str | None = None
+    history_messages: int = 0
+    summary_used: bool = False
+    helper_usage: Usage = field(default_factory=Usage)  # query rewriting
+    cancelled: bool = False
     text: str = ""
     citations: list[Citation] = field(default_factory=list)
     spans: list[Span] = field(default_factory=list)
@@ -76,9 +88,29 @@ class AnswerOutcome:
             "refusal_category": self.refusal_category,
             "citation_coverage": citation_coverage(self.text, self.spans),
             "usage": self.usage.__dict__,
+            "helper_usage": self.helper_usage.__dict__,
+            "search_query": self.search_query,
+            "history_messages": self.history_messages,
+            "summary_used": self.summary_used,
+            "cancelled": self.cancelled,
+            "request_id": self.request_id,
             "timings_ms": self.timings_ms,
             "error": self.error,
         }
+
+    @property
+    def total_cost_usd(self) -> float:
+        return round(self.usage.cost_usd + self.helper_usage.cost_usd, 6)
+
+
+def add_usage(a: Usage, b: Usage) -> Usage:
+    return Usage(
+        input_tokens=a.input_tokens + b.input_tokens,
+        output_tokens=a.output_tokens + b.output_tokens,
+        cache_read_tokens=a.cache_read_tokens + b.cache_read_tokens,
+        cache_write_tokens=a.cache_write_tokens + b.cache_write_tokens,
+        cost_usd=round(a.cost_usd + b.cost_usd, 6),
+    )
 
 
 def citation_coverage(text: str, spans: list[Span]) -> float:
@@ -117,6 +149,10 @@ class AnswerRun:
         filters: SearchFilters,
         top_k: int,
         token_budget: int,
+        history: list[HistoryMessage] | None = None,
+        summary: str | None = None,
+        helper: ConversationHelper | None = None,
+        request_id: str | None = None,
     ) -> None:
         self._retriever = retriever
         self._generator = generator
@@ -124,21 +160,50 @@ class AnswerRun:
         self._filters = filters
         self._top_k = top_k
         self._token_budget = token_budget
-        self.outcome = AnswerOutcome(question=question)
+        self._history = history or []
+        self._summary = summary
+        self._helper = helper
+        self.outcome = AnswerOutcome(
+            question=question,
+            search_query=question,
+            request_id=request_id,
+            history_messages=len(self._history),
+            summary_used=bool(summary),
+        )
+
+    async def _rewrite(self) -> None:
+        """Turn a follow-up into a standalone search query; on failure search the question."""
+        out = self.outcome
+        if not self._history or self._helper is None:
+            return  # a first question is already standalone
+        started = time.perf_counter()
+        context = self._history
+        if self._summary:
+            context = [HistoryMessage("assistant", f"(Summary so far) {self._summary}"), *context]
+        try:
+            result = await self._helper.rewrite(out.question, context)
+        except LLMError as exc:
+            log.warning("answer.rewrite_unavailable", code=exc.code)
+            out.degraded.append("rewrite_unavailable")
+        else:
+            out.search_query = result.text
+            out.helper_usage = add_usage(out.helper_usage, result.usage)
+        out.timings_ms["rewrite"] = _ms(started)
 
     async def events(self) -> AsyncIterator[Event]:
         out = self.outcome
         started = time.perf_counter()
 
+        await self._rewrite()
         retrieval = await self._retriever.retrieve(
             self._principal,
-            out.question,
+            out.search_query,
             top_k=self._top_k,
             token_budget=self._token_budget,
             filters=self._filters,
         )
         search = retrieval.search
-        out.degraded = list(search.degraded)
+        out.degraded += search.degraded
         out.retrieved_chunk_ids = [str(h.chunk_id) for h in search.hits]
         out.context_chunk_ids = [str(c) for b in retrieval.blocks for c in b.chunk_ids]
         out.sources = [_source_payload(i, b) for i, b in enumerate(retrieval.blocks, start=1)]
@@ -146,7 +211,12 @@ class AnswerRun:
         out.timings_ms["retrieval"] = search.timings_ms.get("total", 0.0)
         yield (
             "sources",
-            {"sources": out.sources, "not_found": out.not_found, "degraded": out.degraded},
+            {
+                "sources": out.sources,
+                "not_found": out.not_found,
+                "degraded": out.degraded,
+                "search_query": out.search_query,
+            },
         )
 
         if out.not_found:
@@ -168,6 +238,7 @@ class AnswerRun:
                         "message": exc.message,
                         "retryable": exc.retryable,
                         "partial": bool(out.text),
+                        "request_id": out.request_id,
                     },
                 )
                 return
@@ -179,7 +250,9 @@ class AnswerRun:
         out = self.outcome
         out.model = self._generator.model
         generation_started = time.perf_counter()
-        async for event in self._generator.stream(out.question, blocks):
+        async for event in self._generator.stream(
+            out.question, blocks, self._history, self._summary
+        ):
             match event:
                 case TextDelta(text=text):
                     if "first_token" not in out.timings_ms:
@@ -195,6 +268,8 @@ class AnswerRun:
                             **citation.as_dict(),
                         },
                     )
+                case UsageUpdate(usage=usage, model=model):
+                    out.usage, out.model = usage, model  # so far: kept if the client leaves
                 case Reset(reason=reason, model=model):
                     out.text = ""
                     yield "reset", {"reason": reason, "model": model}

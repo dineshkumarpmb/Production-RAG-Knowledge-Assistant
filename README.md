@@ -14,7 +14,8 @@ See [PLAN.md](PLAN.md) for the full implementation plan. **Everything runs local
 | 4 Reranking and context assembly | Done |
 | 5 Grounded answers with citations, streaming | Done (live Claude calls untested: no API key on this machine) |
 | 6 Authentication, permissions, security | Done |
-| 7 to 12 | Not started (11 is local packaging, not cloud deployment) |
+| 7 Conversations, follow-ups, error handling | Done |
+| 8 to 12 | Not started (11 is local packaging, not cloud deployment) |
 
 ## Quick start
 
@@ -175,3 +176,23 @@ The other security tests:
 - `tests/integration/test_auth.py`: forged, expired, unsigned and wrong-type tokens; refresh reuse; rate limits; immediate role changes.
 - `tests/unit/test_generation.py`: text from a poisoned document stays inside a document block and never reaches the system prompt. The live Claude tests check that the model ignores such text.
 
+## Conversations, follow-up questions and error handling (Phase 7)
+
+- **Follow-up questions:** before retrieval, a cheaper model (`claude-haiku-5-5`, set with `LLM_HELPER_MODEL`) rewrites the latest question into a standalone search query using the recent turns. For example, "what about contractors?" after a question on hotel limits becomes "hotel limit for contractors". The first question in a chat is used as is, at no cost. The rewritten query is sent in the `sources` event and stored in `query_logs.rewritten_query` next to the original. If rewriting fails, retrieval uses the question as asked and the response reports `degraded: ["rewrite_unavailable"]`.
+- **What the answer model sees:** the user's original question, the most recent messages as plain text (`CHAT_HISTORY_MESSAGES`, default 6, each capped at `CHAT_HISTORY_MAX_CHARS`), and a running summary of older turns. The system prompt tells it to use earlier turns only to understand the question and to take facts only from the passages attached now.
+- **Running summary:** once more than `CHAT_SUMMARY_AFTER_MESSAGES` (10) messages are unsummarised, the older ones are folded into `conversations.summary` by the helper model. This happens after the answer has been sent, so it adds no latency, and its cost is added to that turn's query log.
+- **Conversations:** create, list, get, rename (`PATCH /chat/{id}`) and delete (`DELETE /chat/{id}`). Query logs of deleted chats are kept but unlinked, for cost and quality reporting.
+- **Error handling:**
+
+| Failure | Behaviour |
+|---|---|
+| Claude rate limit, server error or timeout | The SDK retries twice, then the stream ends with a typed `error` event; partial text is kept and marked |
+| Embedding model or reranker down | Keyword-only search or no reranking; `degraded` says which |
+| Query rewriting fails | The question is searched as asked; `degraded: ["rewrite_unavailable"]` |
+| Nothing relevant found | "Not found in your documents", with no LLM call |
+| Refusal | Server-side fallback model, otherwise a short refusal message |
+| Ingestion fails | Document `failed` with the reason; `POST /documents/{id}/reprocess` retries |
+| Client disconnects mid-answer | The upstream Claude stream is cancelled (no more tokens billed); the partial answer and the tokens used so far are still saved, marked `cancelled` |
+| Unexpected bug while streaming | An `internal_error` event, and the partial answer is still saved |
+
+- **Request IDs:** every response has `X-Request-ID`. The same ID is in the logs, in the `done` and `error` events, and in `query_logs.request_id`, so one failed answer can be traced end to end.

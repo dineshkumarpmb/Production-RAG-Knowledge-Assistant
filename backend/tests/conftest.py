@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.deps import get_current_user
-from app.api.routes.chat import get_answer_generator
+from app.api.routes.chat import get_answer_generator, get_conversation_helper
 from app.api.routes.search import get_retriever
 from app.core.config import Settings, get_settings
 from app.core.ratelimit import MemoryRateLimiter, get_rate_limiter
@@ -30,6 +30,8 @@ from app.db.session import get_async_sessionmaker, get_db, sync_url
 from app.embeddings import EmbeddingError, EmbeddingResult
 from app.generation.citations import CitationResolver
 from app.generation.claude import LLMError
+from app.generation.conversation import HelperResult
+from app.generation.prompts import HistoryMessage
 from app.generation.types import (
     CitationAdded,
     Completed,
@@ -37,6 +39,7 @@ from app.generation.types import (
     Span,
     TextDelta,
     Usage,
+    UsageUpdate,
 )
 from app.ingestion.pipeline import ingest_document
 from app.main import create_app
@@ -276,14 +279,24 @@ class FakeAnswerGenerator:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, list[ContextBlock]]] = []
-        self.error: LLMError | None = None
+        self.histories: list[tuple[list[HistoryMessage], str | None]] = []
+        self.error: Exception | None = None
+        self.hang = False  # stop after the first delta until cancelled (client disconnects)
 
     async def stream(
-        self, question: str, blocks: Sequence[ContextBlock]
+        self,
+        question: str,
+        blocks: Sequence[ContextBlock],
+        history: Sequence[HistoryMessage] = (),
+        summary: str | None = None,
     ) -> AsyncIterator[GenerationEvent]:
         self.calls.append((question, list(blocks)))
+        self.histories.append((list(history), summary))
+        yield UsageUpdate(Usage(input_tokens=1200, cost_usd=0.0048), self.model)
         lead = "According to the policy, "
         yield TextDelta(lead)
+        if self.hang:
+            await asyncio.Event().wait()
         if self.error is not None:
             raise self.error
         cited = blocks[0].segments[0].text
@@ -310,6 +323,37 @@ class FakeAnswerGenerator:
         )
 
 
+class FakeConversationHelper:
+    """Rewrites a follow-up as "<question> (about: <first earlier user message>)"."""
+
+    model = "fake-haiku"
+
+    def __init__(self) -> None:
+        self.rewrites: list[tuple[str, list[HistoryMessage]]] = []
+        self.summaries: list[tuple[str | None, list[HistoryMessage]]] = []
+        self.error: LLMError | None = None
+
+    async def rewrite(self, question: str, history: Sequence[HistoryMessage]) -> HelperResult:
+        self.rewrites.append((question, list(history)))
+        if self.error:
+            raise self.error
+        topic = next((m.text for m in history if m.role == "user"), "")
+        return HelperResult(
+            f"{question} (about: {topic})", Usage(input_tokens=90, cost_usd=0.00001)
+        )
+
+    async def summarize(
+        self, previous: str | None, messages: Sequence[HistoryMessage]
+    ) -> HelperResult:
+        self.summaries.append((previous, list(messages)))
+        return HelperResult(f"Summary of {len(messages)} messages", Usage(cost_usd=0.00002))
+
+
+@pytest.fixture
+def conversation_helper() -> FakeConversationHelper:
+    return FakeConversationHelper()
+
+
 @pytest.fixture
 def answer_generator() -> FakeAnswerGenerator:
     return FakeAnswerGenerator()
@@ -334,6 +378,7 @@ def app(
     reranker: FakeReranker,
     retrieval_config: RetrievalConfig,
     answer_generator: FakeAnswerGenerator,
+    conversation_helper: FakeConversationHelper,
     rate_limiter: MemoryRateLimiter,
     async_sessions: async_sessionmaker[AsyncSession],
 ) -> FastAPI:
@@ -364,6 +409,7 @@ def app(
             get_current_user: _user,
             get_retriever: lambda: retriever,
             get_answer_generator: lambda: answer_generator,
+            get_conversation_helper: lambda: conversation_helper,
             get_rate_limiter: lambda: rate_limiter,
         }
     )

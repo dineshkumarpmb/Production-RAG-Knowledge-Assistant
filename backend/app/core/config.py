@@ -82,6 +82,13 @@ class Settings(BaseSettings):
     llm_fallbacks: bool = True  # re-run refused requests on Anthropic's recommended model
     llm_timeout_seconds: float = 120.0
     llm_max_retries: int = 2
+    # Conversations (Phase 7). A cheaper model rewrites follow-ups into standalone search queries
+    # and keeps a running summary of older turns.
+    llm_helper_model: str = "claude-haiku-5-5"
+    chat_history_messages: int = 6  # most recent messages Claude sees verbatim
+    chat_history_max_chars: int = 2000  # per message; longer ones are shortened
+    chat_summary_after_messages: int = 10  # summarise older turns once history exceeds this
+
     # Per-model prices in USD per million tokens, overriding app.generation.pricing, e.g.
     # {"claude-opus-5-5": {"input": 4, "output": 20, "cache_read": 0.2, "cache_write": 5}}
     llm_prices: dict[str, dict[str, float]] = {}

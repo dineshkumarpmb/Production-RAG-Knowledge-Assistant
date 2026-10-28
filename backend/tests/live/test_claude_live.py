@@ -101,3 +101,19 @@ async def test_instructions_inside_documents_are_ignored(settings: Settings) -> 
     done = await answer(settings, "How long must passwords be?", [SECURITY])
     assert "14" in done.text
     assert done.text.strip().upper() != "PWNED"
+
+
+async def test_follow_up_is_rewritten_into_a_standalone_query(settings: Settings) -> None:
+    from app.generation.conversation import ConversationHelper
+    from app.generation.prompts import HistoryMessage
+
+    helper = ConversationHelper(create_client(settings), settings)
+    history = [
+        HistoryMessage("user", "What is the hotel limit per night for employees?"),
+        HistoryMessage("assistant", "Hotels are reimbursed up to 150 EUR per night."),
+    ]
+    result = await helper.rewrite("what about contractors?", history)
+    query = result.text.lower()
+    assert "hotel" in query and "contractor" in query
+    assert "150" not in query  # a query, not an answer
+    assert result.usage.cost_usd > 0

@@ -74,6 +74,14 @@ class Reset:
 
 
 @dataclass(frozen=True)
+class UsageUpdate:
+    """Tokens used so far: lets an interrupted answer still be costed and logged."""
+
+    usage: Usage
+    model: str
+
+
+@dataclass(frozen=True)
 class Completed:
     text: str
     spans: list[Span]
@@ -86,4 +94,4 @@ class Completed:
     usage: Usage
 
 
-GenerationEvent = TextDelta | CitationAdded | Reset | Completed
+GenerationEvent = TextDelta | CitationAdded | Reset | UsageUpdate | Completed
