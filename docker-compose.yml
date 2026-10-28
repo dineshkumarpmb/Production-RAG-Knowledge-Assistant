@@ -1,0 +1,104 @@
+# Everything runs locally. `docker compose up -d --build`; the first start downloads the local
+# models (~2.5 GB) into the `hf_cache` volume, so it takes a while once.
+x-image: &image
+  build:
+    context: ./backend
+    args:
+      EXTRAS: local
+  image: rag-backend:local
+
+x-settings: &settings
+  ENV: ${ENV:-dev}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  # Local by default: bge-m3 embeddings and a cross-encoder reranker, served by `models`.
+  # For hosted Voyage instead: EMBEDDING_PROVIDER=voyage / RERANKER_PROVIDER=voyage + key.
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+  RERANKER_PROVIDER: ${RERANKER_PROVIDER:-local}
+  RERANKER_MODEL: ${RERANKER_MODEL:-}
+  RERANK_MIN_SCORE: ${RERANK_MIN_SCORE:-}
+  VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+  # Answers (Phase 5): Claude via the Anthropic API.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  LLM_MODEL: ${LLM_MODEL:-claude-opus-5-5}
+  LLM_EFFORT: ${LLM_EFFORT:-medium}
+
+x-backend: &backend
+  <<: *image
+  environment:
+    <<: *settings
+    DATABASE_URL: postgresql+psycopg://rag:rag@postgres:5432/rag
+    REDIS_URL: redis://redis:6379/0
+    STORAGE_DIR: /data/uploads
+    MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
+    MODEL_SERVER_URL: http://models:8001
+  volumes:
+    - uploads:/data/uploads
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    models:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"  # 5433 on the host avoids clashing with a local Postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Loads the embedding model and reranker once; the API and worker call it over HTTP.
+  models:
+    <<: *image
+    command: uvicorn app.model_server:app --host 0.0.0.0 --port 8001
+    environment:
+      <<: *settings
+      LOCAL_MODEL_DTYPE: ${LOCAL_MODEL_DTYPE:-float32}
+    volumes:
+      - hf_cache:/home/app/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/healthz')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30m  # first start downloads the models
+
+  api:
+    <<: *backend
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads:/data/uploads
+      - ./eval:/eval  # datasets in, reports out (python -m app.evaluation.retrieval)
+
+  worker:
+    <<: *backend
+    command: celery -A app.workers.celery_app:celery_app worker --loglevel=INFO --concurrency=1 -Q ingestion  # one job at a time: models share little RAM
+
+volumes:
+  pgdata:
+  uploads:
+  hf_cache:
