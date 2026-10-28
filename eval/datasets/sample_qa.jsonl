@@ -1,0 +1,14 @@
+{"id": "q01", "type": "exact-term", "question": "What does incident code SEC-2209 mean?", "gold": [{"filename": "security-standard.md", "page": 1, "heading": "Incident codes"}]}
+{"id": "q02", "type": "exact-term", "question": "SEC-4471", "gold": [{"filename": "security-standard.md", "page": 1, "heading": "Incident codes"}]}
+{"id": "q03", "type": "single-fact", "question": "How many days of annual leave do full-time employees get?", "gold": [{"filename": "leave-policy.md", "page": 1, "heading": "Annual leave"}]}
+{"id": "q04", "type": "paraphrase", "question": "How much vacation can I take each year?", "gold": [{"filename": "leave-policy.md", "page": 1, "heading": "Annual leave"}]}
+{"id": "q05", "type": "paraphrase", "question": "What is the nightly lodging limit when I travel to Paris?", "gold": [{"filename": "travel-expenses.md", "page": 1, "heading": "Hotels"}]}
+{"id": "q06", "type": "single-fact", "question": "How long do I have to submit an expense claim?", "gold": [{"filename": "travel-expenses.md", "page": 1, "heading": "Submitting claims"}]}
+{"id": "q07", "type": "paraphrase", "question": "Do I need two-step verification to sign in to the VPN?", "gold": [{"filename": "security-standard.md", "page": 1, "heading": "Passwords"}]}
+{"id": "q08", "type": "single-fact", "question": "How many weeks of paid leave do partners get after a birth?", "gold": [{"filename": "leave-policy.md", "page": 1, "heading": "Parental leave"}]}
+{"id": "q09", "type": "paraphrase", "question": "Can I work from Spain for a couple of weeks?", "gold": [{"filename": "remote-work.md", "page": 1, "heading": "Working abroad"}]}
+{"id": "q10", "type": "multi-hop", "question": "What equipment do I get for home working, and does the laptop have to be encrypted?", "gold": [{"filename": "remote-work.md", "page": 1, "heading": "Equipment"}, {"filename": "security-standard.md", "page": 1, "heading": "Device encryption"}]}
+{"id": "q11", "type": "paraphrase", "question": "What is the daily food budget on business trips?", "gold": [{"filename": "travel-expenses.md", "page": 1, "heading": "Meals and per diem"}]}
+{"id": "q12", "type": "numeric", "question": "How many characters must a password have?", "gold": [{"filename": "security-standard.md", "page": 1, "heading": "Passwords"}]}
+{"id": "q13", "type": "unanswerable", "question": "Are dogs allowed in the office?", "gold": []}
+{"id": "q14", "type": "unanswerable", "question": "Who is the CEO of Northwind?", "gold": []}
