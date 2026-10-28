@@ -8,12 +8,12 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.api.routes.search import get_retriever
 from app.db.access import Principal
-from app.db.models import QueryLog, Role, User
+from app.db.models import Document, QueryLog, Role, User
 from app.generation.claude import LLMError
 from app.generation.prompts import NOT_FOUND_ANSWER
 from app.retrieval.context import ContextBlock, ContextSegment
@@ -68,7 +68,28 @@ class FakeRetriever:
 
 
 @pytest.fixture
-def retriever(app: FastAPI) -> FakeRetriever:
+def retriever(
+    app: FastAPI,
+    sync_sessions: sessionmaker[Session],
+    tenant_and_user: tuple[uuid.UUID, uuid.UUID],
+) -> FakeRetriever:
+    # The cited document must exist and be readable, or stored citations are redacted.
+    with sync_sessions() as s, s.begin():
+        s.add(
+            Document(
+                id=DOC,
+                tenant_id=tenant_and_user[0],
+                owner_id=tenant_and_user[1],
+                filename="travel.pdf",
+                file_type="pdf",
+                mime_type="application/pdf",
+                size_bytes=1,
+                sha256="1" * 64,
+                storage_uri="local://none",
+                status="ready",
+                meta={},
+            )
+        )
     fake = FakeRetriever([PASSAGE])
     app.dependency_overrides[get_retriever] = lambda: fake
     return fake
@@ -261,3 +282,19 @@ async def test_unexpected_failure_still_ends_the_stream_and_saves(
     with sync_sessions() as s:
         (log,) = s.scalars(select(QueryLog)).all()
     assert log.error == "internal_error"
+
+
+async def test_citations_to_documents_no_longer_readable_are_redacted(
+    client: httpx.AsyncClient, retriever: FakeRetriever, sync_sessions: sessionmaker[Session]
+) -> None:
+    conversation_id = await new_conversation(client)
+    await ask(client, conversation_id, "What is the hotel limit?")
+    with sync_sessions() as s, s.begin():
+        s.execute(delete(Document).where(Document.id == DOC))  # or unshared: same effect
+
+    assistant = (await client.get(f"/chat/{conversation_id}")).json()["messages"][-1]
+    (citation,) = assistant["citations"]
+    assert citation["redacted"] is True and citation["source"] == 1
+    assert "cited_text" not in citation and "chunk_ids" not in citation
+    (source,) = assistant["metadata"]["sources"]
+    assert source["redacted"] is True and "title" not in source

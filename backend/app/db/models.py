@@ -19,6 +19,7 @@ from sqlalchemy import (
     Uuid,
     func,
 )
+from sqlalchemy import true as sa_true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, JSONType
@@ -77,8 +78,9 @@ class User(Base):
         ForeignKey("tenants.id", ondelete="CASCADE"), index=True
     )
     email: Mapped[str] = mapped_column(String(320), unique=True)
-    password_hash: Mapped[str | None] = mapped_column(String(255))  # set once auth lands (Phase 6)
+    password_hash: Mapped[str | None] = mapped_column(String(255))  # argon2id
     role: Mapped[str] = mapped_column(String(20), default=Role.VIEWER)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=sa_true())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -275,4 +277,93 @@ class QueryLog(Base):
     error: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+
+class PrincipalType(StrEnum):
+    USER = "user"
+    GROUP = "group"
+
+
+class Permission(StrEnum):
+    READ = "read"
+    WRITE = "write"  # read + reprocess + resolve duplicates (sharing and deletion stay with owner)
+
+
+class Group(Base):
+    __tablename__ = "groups"
+    __table_args__ = (UniqueConstraint("tenant_id", "name"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserGroup(Base):
+    __tablename__ = "user_groups"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+
+
+class DocumentAcl(Base):
+    """A grant on one document to a user or a group of the same tenant."""
+
+    __tablename__ = "document_acl"
+    __table_args__ = (
+        UniqueConstraint("document_id", "principal_type", "principal_id"),
+        CheckConstraint(_one_of("principal_type", PrincipalType), name="principal_type_valid"),
+        CheckConstraint(_one_of("permission", Permission), name="permission_valid"),
+        Index("ix_document_acl_principal", "principal_type", "principal_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    principal_type: Mapped[str] = mapped_column(String(10))
+    principal_id: Mapped[uuid.UUID] = mapped_column(Uuid)  # users.id or groups.id
+    permission: Mapped[str] = mapped_column(String(10), default=Permission.READ)
+    granted_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RefreshToken(Base):
+    """Opaque refresh tokens, stored hashed. Each use rotates the token within its family;
+    presenting a token that was already rotated revokes the whole family (likely theft)."""
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    family_id: Mapped[uuid.UUID] = mapped_column(Uuid, index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_log"
+    __table_args__ = (Index("ix_audit_log_tenant_id_created_at", "tenant_id", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE")
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    action: Mapped[str] = mapped_column(String(50))  # e.g. "login", "document.share"
+    target_type: Mapped[str | None] = mapped_column(String(50))
+    target_id: Mapped[str | None] = mapped_column(String(100))
+    ip: Mapped[str | None] = mapped_column(String(64))
+    details: Mapped[dict[str, Any]] = mapped_column(JSONType, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), server_default=func.now()
     )

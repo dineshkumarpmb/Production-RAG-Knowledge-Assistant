@@ -5,6 +5,8 @@ from typing import Literal
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEV_JWT_SECRET = "dev-only-insecure-jwt-secret-change-me"  # noqa: S105
+
 
 class Settings(BaseSettings):
     """Application settings, read from environment variables and `.env`."""
@@ -18,7 +20,11 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = True
 
-    database_url: str = "postgresql+psycopg://rag:rag@localhost:5433/rag"
+    # The app connects as `rag_app`, an ordinary role, so Postgres row-level security applies;
+    # migrations run as the owner (`rag`), which RLS does not restrict.
+    database_url: str = "postgresql+psycopg://rag_app:rag_app@localhost:5433/rag"
+    migration_database_url: str | None = None  # None: use database_url
+    app_db_password: SecretStr = SecretStr("rag_app")  # set on the rag_app role by migration 0005
     redis_url: str = "redis://localhost:6379/0"
 
     storage_dir: Path = Path("./data/uploads")
@@ -87,13 +93,26 @@ class Settings(BaseSettings):
     local_model_device: str | None = None  # "cpu" / "cuda"; None picks automatically
     local_model_dtype: Literal["float32", "float16", "bfloat16"] = "float32"
 
-    # Placeholder identity used until authentication lands in Phase 6.
-    dev_tenant_name: str = "default"
-    dev_user_email: str = "dev@example.com"
+    # Authentication (Phase 6)
+    jwt_secret: SecretStr = SecretStr(DEV_JWT_SECRET)  # refused when ENV=prod
+    access_token_minutes: int = 15
+    refresh_token_days: int = 14
+    allow_registration: bool = True  # POST /auth/register creates an organisation + its admin
+
+    # Web security
+    cors_origins: list[str] = ["http://localhost:5173"]  # the Vite dev server (Phase 8)
+    rate_limit_chat_per_minute: int = 20
+    rate_limit_search_per_minute: int = 60
+    rate_limit_upload_per_minute: int = 30
+    rate_limit_login_per_minute: int = 10
 
     @property
     def is_prod(self) -> bool:
         return self.env == "prod"
+
+    @property
+    def migrations_url(self) -> str:
+        return self.migration_database_url or self.database_url
 
 
 @lru_cache

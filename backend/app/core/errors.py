@@ -22,11 +22,19 @@ _VALID_REQUEST_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 class AppError(Exception):
     """An error that is safe to show to the client."""
 
-    def __init__(self, code: str, message: str, status_code: int = 400) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status_code: int = 400,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status_code = status_code
+        self.headers = headers
 
 
 class NotFoundError(AppError):
@@ -34,10 +42,13 @@ class NotFoundError(AppError):
         super().__init__("not_found", f"{what} not found.", 404)
 
 
-def error_response(code: str, message: str, status_code: int) -> JSONResponse:
+def error_response(
+    code: str, message: str, status_code: int, headers: dict[str, str] | None = None
+) -> JSONResponse:
     return JSONResponse(
         {"code": code, "message": message, "request_id": request_id_var.get()},
         status_code=status_code,
+        headers=headers,
     )
 
 
@@ -71,7 +82,7 @@ class RequestIdMiddleware:
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(_: Request, exc: AppError) -> JSONResponse:
-        return error_response(exc.code, exc.message, exc.status_code)
+        return error_response(exc.code, exc.message, exc.status_code, exc.headers)
 
     @app.exception_handler(StarletteHTTPException)
     async def handle_http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:

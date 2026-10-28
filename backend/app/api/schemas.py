@@ -9,6 +9,7 @@ class DocumentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
+    owner_id: uuid.UUID
     title: str | None
     filename: str
     file_type: str

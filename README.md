@@ -13,7 +13,8 @@ See [PLAN.md](PLAN.md) for the full implementation plan. **Everything runs local
 | 3 Hybrid retrieval | Done (first eval run on local bge-m3: see results below) |
 | 4 Reranking and context assembly | Done |
 | 5 Grounded answers with citations, streaming | Done (live Claude calls untested: no API key on this machine) |
-| 6 to 12 | Not started (11 is local packaging, not cloud deployment) |
+| 6 Authentication, permissions, security | Done |
+| 7 to 12 | Not started (11 is local packaging, not cloud deployment) |
 
 ## Quick start
 
@@ -37,7 +38,7 @@ curl -H "Content-Type: application/json" -d '{"query": "hotel limit in Paris"}' 
 curl -H "Content-Type: application/json" -d '{"query": "SEC-4471"}'      http://localhost:8000/admin/search/debug                    # keyword, vector and fused rankings
 ```
 
-Until authentication lands in Phase 6, every request acts as one dev user (`dev@example.com`). This is disabled when `ENV=prod`.
+Every endpoint except `/healthz`, `/readyz` and `/auth/*` needs a bearer token. Create an organisation with `POST /auth/register` (its first user becomes the admin), then sign in with `POST /auth/login` (form fields `username` = email, `password`) and send `Authorization: Bearer <access_token>`. The interactive docs at `/docs` have an Authorize button for this flow.
 
 ## Development
 
@@ -138,3 +139,39 @@ curl http://localhost:8000/chat/$CID                    # stored messages with c
 - **Cost:** computed from `usage`, including cache reads and writes. When a fallback ran, each attempt in `usage.iterations` is priced at its own model's rates. Prices live in `app/generation/pricing.py` (Opus 5.5: $4 / $20 per million input / output tokens, $0.20 for cache reads) and can be overridden with `LLM_PRICES`.
 - **Stored:** the user and assistant messages (the assistant message with its citations, cited spans and metadata), and a `query_logs` row per question with retrieved and context chunk IDs, per-stage latency, tokens, cost, model, stop reason and any error.
 - **Tests:** the SDK stream is replayed with fake events (cited answer, mid-stream fallback, refusal, truncation, each error class), the SSE contract is tested through the API, and chat runs end to end on Postgres with real retrieval. `tests/live/` calls the real API: a cited answer, prompt-cache reuse, "not found" for an unrelated question, and an injected instruction inside a document being ignored. These tests are skipped unless `ANTHROPIC_API_KEY` is set.
+
+## Authentication, permissions and security (Phase 6)
+
+- **Accounts:** `POST /auth/register` creates an organisation and its admin (disable with `ALLOW_REGISTRATION=false`). Admins create users (`viewer`, `editor`, `admin`) and groups under `/admin`. Passwords are hashed with argon2id, and a login attempt takes the same time whether or not the email exists.
+- **Tokens:** access tokens are HS256 JWTs valid for 15 minutes, with the algorithm pinned and the token type checked. Refresh tokens are random, stored only as SHA-256 hashes and rotated on every use; replaying a rotated token revokes the whole session family. Role and active status are read from the database on every request, so demoting or deactivating a user takes effect immediately and also revokes their refresh tokens. The server refuses to start with `ENV=prod` and the development `JWT_SECRET`.
+- **Roles:** viewers read and ask questions; editors also upload; admins also manage users, groups and the audit log. Admins get **no** extra read access to documents.
+- **Sharing:** documents start private to the uploader. The owner (or an admin) can share with a user or group (`read` or `write`) via `POST /documents/{id}/access`, or with the whole organisation via `PATCH /documents/{id}` `{"visibility": "tenant"}`. `write` allows reprocessing and resolving duplicates; deleting and sharing stay with the owner. Anything a user cannot read answers **404**, so document IDs reveal nothing.
+- **Two independent layers enforce reads:**
+  1. Every query applies one rule (`app/db/access.py`): search, retrieval, chat, document pages and chunks, and file download.
+  2. **Postgres row-level security** on `documents`, `document_pages` and `chunks`. The app connects as `rag_app` (not a superuser, no `BYPASSRLS`; superusers always bypass RLS), and each database session carries the user's scope in transaction-local settings. A session without a scope sees no rows. The ingestion worker uses an explicit `system` scope; admin reports and duplicate checks use a `tenant` scope.
+- **Chat history:** citations and sources pointing at documents the user can no longer read (unshared or deleted) are replaced by a placeholder when history is loaded.
+- **Web hardening:** per-user rate limits in Redis (chat 20/min, search 60/min, uploads 30/min, sign-in 10/min per email and IP; returns 429 with `Retry-After`). CORS is limited to `CORS_ORIGINS`. Security headers are set on every response (`nosniff`, `DENY` framing, no-referrer, a `default-src 'none'` CSP and `no-store` on API responses).
+- **Audit log** (`GET /admin/audit`): sign-ins and failed sign-ins, refresh-token reuse, registration, uploads, downloads, sharing, visibility changes, deletions, replacements, user and group changes, and chat questions, each with user, target and client IP.
+- **Upload safety** (from Phase 1): extension plus magic-byte checks, size limits, rejection of DOCX files with macros and of zip bombs, and safe file names. Uploaded content is never executed. ClamAV scanning is not included.
+
+### Permissions matrix (zero leaks)
+
+`tests/postgres/test_permissions_matrix.py` uploads one document per sharing mode, then checks six users across **ten channels**: document list, single document, pages, chunks, file download, keyword, vector and hybrid search, `/retrieve`, and chat sources. It runs through the API on Postgres with row-level security active. Every user must see exactly the ticked documents on every channel; an extra one fails the test as a leak, and a missing one fails it as broken sharing.
+
+| User | private | group | user | tenant | other-org |
+|---|:---:|:---:|:---:|:---:|:---:|
+| alice (owner) | ✅ | ✅ | ✅ | ✅ | — |
+| bob (Finance) | — | ✅ | — | ✅ | — |
+| carol (shared) | — | — | ✅ | ✅ | — |
+| dave (colleague) | — | — | — | ✅ | — |
+| admin (Acme) | — | — | — | ✅ | — |
+| eve (other org) | — | — | — | — | ✅ |
+
+The documents are: *private* (Alice only), *group* (shared with Finance), *user* (shared with Carol), *tenant* (visible to everyone at Acme) and *other-org* (another organisation's tenant-wide document).
+
+The other security tests:
+- `tests/postgres/test_rls.py`: raw `SELECT`s with no application filter show each user exactly their rows; no scope means no rows; writes into another tenant are rejected; scopes don't leak between pooled connections.
+- `tests/integration/test_sharing.py`: every document route answers 404 to outsiders, including another organisation's admin and the own organisation's admin; admin APIs are confined to their own organisation.
+- `tests/integration/test_auth.py`: forged, expired, unsigned and wrong-type tokens; refresh reuse; rate limits; immediate role changes.
+- `tests/unit/test_generation.py`: text from a poisoned document stays inside a document block and never reaches the system prompt. The live Claude tests check that the model ignores such text.
+

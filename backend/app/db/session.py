@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
+from app.db.access import RlsContext, rls_session_info
 
 
 def sync_url(url: str) -> URL:
@@ -33,8 +34,10 @@ def get_async_sessionmaker() -> async_sessionmaker[AsyncSession]:
 
 @lru_cache
 def get_sync_sessionmaker() -> sessionmaker[Session]:
+    """Sessions for the ingestion worker: system scope, so row-level security lets it process
+    every tenant's documents. API sessions get a per-user scope instead (see api.deps)."""
     engine = create_engine(sync_url(get_settings().database_url), pool_pre_ping=True)
-    return sessionmaker(engine, expire_on_commit=False)
+    return sessionmaker(engine, expire_on_commit=False, info=rls_session_info(RlsContext.system()))
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:

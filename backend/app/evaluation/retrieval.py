@@ -351,7 +351,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--configs", nargs="+", default=list(CONFIGS), choices=list(CONFIGS))
     parser.add_argument("--k", type=int, nargs="+", default=list(DEFAULT_KS))
-    parser.add_argument("--user-email", default=settings.dev_user_email)
+    parser.add_argument(
+        "--user-email",
+        required=True,
+        help="search as this user (who must be able to read the corpus)",
+    )
     parser.add_argument("--out", type=Path, default=Path("../eval/reports"))
     args = parser.parse_args(argv)
 

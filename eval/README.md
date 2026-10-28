@@ -9,9 +9,9 @@
 ```bash
 docker compose up -d --build
 cd backend
-python -m app.evaluation.load_corpus ../eval/corpus/sample --api http://localhost:8000
+python -m app.evaluation.load_corpus ../eval/corpus/sample --email you@example.com --password ...
 docker compose exec api python -m app.evaluation.retrieval \
-  --dataset /eval/datasets/sample_qa.jsonl --out /eval/reports --k 1 3 5 10
+  --dataset /eval/datasets/sample_qa.jsonl --out /eval/reports --k 1 3 5 10 --user-email you@example.com
 ```
 
-The evaluation runs inside the `api` container, so it uses the same model server and settings as the app; `./eval` is mounted at `/eval`. Add `--configs hybrid hybrid+rerank` to run only some configurations. It searches as the dev user who uploaded the corpus.
+The evaluation runs inside the `api` container, so it uses the same model server and settings as the app; `./eval` is mounted at `/eval`. Add `--configs hybrid hybrid+rerank` to run only some configurations. It searches as `--user-email`, so use the account that uploaded the corpus (or one it is shared with); access rules apply to the evaluation just as they do to the app.

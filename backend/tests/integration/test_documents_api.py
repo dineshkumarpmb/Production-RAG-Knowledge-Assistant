@@ -168,7 +168,7 @@ async def test_private_documents_hidden_from_other_users(
     doc_id = (await upload(client, files.handbook_pdf(tmp_path / "h.pdf"))).json()["document"]["id"]
 
     with sync_sessions() as s, s.begin():
-        bob = User(tenant_id=tenant_and_user[0], email="bob@acme.test", role=Role.VIEWER)
+        bob = User(tenant_id=tenant_and_user[0], email="bob@acme.test", role=Role.EDITOR)
         s.add(bob)
         s.flush()
         identity.user_id = bob.id

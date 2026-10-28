@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings
-from app.db.access import Principal
+from app.db.access import Principal, RlsContext, set_rls_async
 from app.db.models import Chunk, Document, Role, Tenant, User, Visibility
 from app.retrieval.queries import uses_search_syntax, vector_search
 from app.retrieval.types import SearchFilters
@@ -378,6 +378,7 @@ async def test_iterative_hnsw_scan_keeps_recall_under_access_filters(
     engine = create_async_engine(settings.database_url)
     try:
         async with AsyncSession(engine) as session:
+            await set_rls_async(session, RlsContext.for_principal(principal))
             await session.execute(text("SET LOCAL enable_sort = off"))
             await session.execute(text("SET LOCAL hnsw.ef_search = 10"))
             plan = " | ".join(

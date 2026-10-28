@@ -17,18 +17,19 @@ from functools import lru_cache
 from typing import Annotated, Any
 
 import structlog
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sse_starlette.sse import EventSourceResponse
 
-from app.api.deps import CurrentUser, DbSession, SettingsDep
+from app.api.deps import CurrentPrincipal, DbSession, SettingsDep, rate_limit
 from app.api.routes.search import FiltersIn, RetrieverDep
+from app.core.audit import audit
 from app.core.config import get_settings
 from app.core.errors import NotFoundError
-from app.db.access import Principal
-from app.db.models import Conversation, Message, MessageRole, QueryLog, User
+from app.db.access import Principal, can_read
+from app.db.models import Conversation, Document, Message, MessageRole, QueryLog
 from app.db.session import get_async_sessionmaker
 from app.generation.claude import AnswerGenerator, ClaudeAnswerGenerator, create_client
 from app.generation.service import AnswerOutcome, AnswerRun
@@ -88,19 +89,60 @@ class AskRequest(BaseModel):
 
 
 async def _own_conversation(
-    db: AsyncSession, user: User, conversation_id: uuid.UUID
+    db: AsyncSession, principal: Principal, conversation_id: uuid.UUID
 ) -> Conversation:
     conversation = await db.get(Conversation, conversation_id)
-    if conversation is None or conversation.user_id != user.id:
+    if conversation is None or conversation.user_id != principal.user_id:
         raise NotFoundError("Conversation")
     return conversation
 
 
+_REDACTED = {"redacted": True, "reason": "You no longer have access to this document."}
+
+
+async def _redact_revoked(
+    db: AsyncSession, principal: Principal, messages: list[Message]
+) -> list[MessageOut]:
+    """Citations and sources of documents the user can no longer read (unshared, deleted) are
+    replaced by a placeholder: an old answer must not keep showing their text or titles."""
+    doc_ids = {
+        uuid.UUID(ref["document_id"])
+        for m in messages
+        for ref in (*m.citations, *m.meta.get("sources", []))
+        if ref.get("document_id")
+    }
+    readable = (
+        set(
+            await db.scalars(
+                select(Document.id).where(Document.id.in_(doc_ids), can_read(principal))
+            )
+        )
+        if doc_ids
+        else set()
+    )
+
+    def clean(ref: dict[str, Any]) -> dict[str, Any]:
+        if ref.get("document_id") and uuid.UUID(ref["document_id"]) not in readable:
+            return {"source": ref.get("source"), **_REDACTED}
+        return ref
+
+    out = []
+    for m in messages:
+        item = MessageOut.model_validate(m)
+        item.citations = [clean(c) for c in m.citations]
+        if "sources" in item.metadata:
+            item.metadata = {**item.metadata, "sources": [clean(x) for x in m.meta["sources"]]}
+        out.append(item)
+    return out
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_conversation(
-    body: ConversationCreate, db: DbSession, user: CurrentUser
+    body: ConversationCreate, db: DbSession, principal: CurrentPrincipal
 ) -> ConversationOut:
-    conversation = Conversation(tenant_id=user.tenant_id, user_id=user.id, title=body.title or "")
+    conversation = Conversation(
+        tenant_id=principal.tenant_id, user_id=principal.user_id, title=body.title or ""
+    )
     db.add(conversation)
     await db.commit()
     await db.refresh(conversation)
@@ -110,13 +152,13 @@ async def create_conversation(
 @router.get("")
 async def list_conversations(
     db: DbSession,
-    user: CurrentUser,
+    principal: CurrentPrincipal,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[ConversationOut]:
     rows = await db.scalars(
         select(Conversation)
-        .where(Conversation.user_id == user.id)
+        .where(Conversation.user_id == principal.user_id)
         .order_by(Conversation.updated_at.desc(), Conversation.id)
         .limit(limit)
         .offset(offset)
@@ -126,26 +168,32 @@ async def list_conversations(
 
 @router.get("/{conversation_id}")
 async def get_conversation(
-    conversation_id: uuid.UUID, db: DbSession, user: CurrentUser
+    conversation_id: uuid.UUID, db: DbSession, principal: CurrentPrincipal
 ) -> ConversationDetail:
-    conversation = await _own_conversation(db, user, conversation_id)
-    messages = await db.scalars(
-        select(Message)
-        .where(Message.conversation_id == conversation.id)
-        .order_by(Message.created_at, Message.id)
+    conversation = await _own_conversation(db, principal, conversation_id)
+    messages = list(
+        await db.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation.id)
+            .order_by(Message.created_at, Message.id)
+        )
     )
     return ConversationDetail(
         **ConversationOut.model_validate(conversation).model_dump(),
-        messages=[MessageOut.model_validate(m) for m in messages],
+        messages=await _redact_revoked(db, principal, messages),
     )
 
 
-@router.post("/{conversation_id}/messages")
+@router.post(
+    "/{conversation_id}/messages",
+    dependencies=[Depends(rate_limit("chat", "rate_limit_chat_per_minute"))],
+)
 async def ask(
     conversation_id: uuid.UUID,
     body: AskRequest,
+    request: Request,
     db: DbSession,
-    user: CurrentUser,
+    principal: CurrentPrincipal,
     retriever: RetrieverDep,
     generator: GeneratorDep,
     sessions: SessionsDep,
@@ -153,23 +201,32 @@ async def ask(
 ) -> EventSourceResponse:
     """Answer a question from the user's documents, streamed as Server-Sent Events:
     `sources`, then `delta` / `citation` (repeated), then `done` (or `error`)."""
-    conversation = await _own_conversation(db, user, conversation_id)
+    conversation = await _own_conversation(db, principal, conversation_id)
     if not conversation.title:
         conversation.title = body.content[:_TITLE_LENGTH]
     db.add(Message(conversation_id=conversation.id, role=MessageRole.USER, content=body.content))
+    audit(
+        db,
+        "chat.query",
+        tenant_id=principal.tenant_id,
+        user_id=principal.user_id,
+        target_type="conversation",
+        target_id=conversation.id,
+        request=request,
+    )
     await db.commit()
 
     run = AnswerRun(
         retriever,
         generator,
-        Principal.of(user),
+        principal,
         body.content,
         filters=body.filters.to_filters(),
         top_k=settings.rerank_top_k,
         token_budget=settings.context_token_budget,
     )
     message_id = uuid.uuid4()
-    tenant_id, user_id = user.tenant_id, user.id
+    tenant_id, user_id = principal.tenant_id, principal.user_id
 
     async def stream() -> AsyncIterator[dict[str, str]]:
         # Runs after the request's DB session has closed, so it uses its own sessions.

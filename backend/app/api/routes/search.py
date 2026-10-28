@@ -6,11 +6,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from app.api.deps import CurrentUser, SettingsDep
-from app.api.routes.admin import AdminUser
+from app.api.deps import AdminPrincipal, CurrentPrincipal, SettingsDep, rate_limit
 from app.core.errors import AppError
 from app.db.access import Principal
-from app.db.models import FileType, User
+from app.db.models import FileType
 from app.db.session import get_async_sessionmaker
 from app.embeddings import get_embedding_provider
 from app.rerank import get_reranker
@@ -31,6 +30,7 @@ def get_retriever(settings: SettingsDep) -> HybridRetriever:
 
 
 RetrieverDep = Annotated[HybridRetriever, Depends(get_retriever)]
+_search_limit = Depends(rate_limit("search", "rate_limit_search_per_minute"))
 
 
 class FiltersIn(BaseModel):
@@ -174,13 +174,13 @@ def _response(body: SearchRequest, result: SearchResult) -> SearchResponse:
 
 async def _search(
     retriever: HybridRetriever,
-    user: User,
+    principal: Principal,
     body: SearchRequest,
     config: RetrievalConfig | None = None,
 ) -> SearchResult:
     try:
         return await retriever.search(
-            Principal.of(user),
+            principal,
             body.query,
             mode=body.mode,
             top_k=body.top_k,
@@ -193,20 +193,25 @@ async def _search(
         raise AppError("vector_unavailable", f"Vector search is unavailable: {exc}", 503) from exc
 
 
-@router.post("/search")
-async def search(body: SearchRequest, user: CurrentUser, retriever: RetrieverDep) -> SearchResponse:
+@router.post("/search", dependencies=[_search_limit])
+async def search(
+    body: SearchRequest, principal: CurrentPrincipal, retriever: RetrieverDep
+) -> SearchResponse:
     """Hybrid (keyword + vector) search over the chunks of documents the user can read."""
-    return _response(body, await _search(retriever, user, body))
+    return _response(body, await _search(retriever, principal, body))
 
 
-@router.post("/retrieve")
+@router.post("/retrieve", dependencies=[_search_limit])
 async def retrieve(
-    body: RetrieveRequest, user: CurrentUser, retriever: RetrieverDep, settings: SettingsDep
+    body: RetrieveRequest,
+    principal: CurrentPrincipal,
+    retriever: RetrieverDep,
+    settings: SettingsDep,
 ) -> RetrieveResponse:
     """The context an answer would be grounded in: hybrid search, reranking, then adjacent
     chunks merged into passages within a token budget."""
     result = await retriever.retrieve(
-        Principal.of(user),
+        principal,
         body.query,
         top_k=body.top_k or settings.rerank_top_k,
         token_budget=body.token_budget or settings.context_token_budget,
@@ -227,7 +232,7 @@ async def retrieve(
 
 @router.post("/admin/search/debug", tags=["admin"])
 async def search_debug(
-    body: DebugSearchRequest, user: AdminUser, retriever: RetrieverDep
+    body: DebugSearchRequest, principal: AdminPrincipal, retriever: RetrieverDep
 ) -> DebugSearchResponse:
     """Keyword, vector and fused rankings side by side, with tunable parameters. With
     `rerank`, each hit also shows its rank before reranking (`fused_rank`)."""
@@ -240,7 +245,7 @@ async def search_debug(
         rerank_candidates=body.rerank_candidates,
         rerank_min_score=body.rerank_min_score,
     )
-    result = await _search(retriever, user, body, config)
+    result = await _search(retriever, principal, body, config)
     return DebugSearchResponse(
         **_response(body, result).model_dump(),
         keyword=_ranked(result.keyword),

@@ -17,7 +17,8 @@ target_metadata = Base.metadata
 
 
 def _database_url() -> str:
-    return sync_url(get_settings().database_url).render_as_string(hide_password=False)
+    # The owner role: migrations create tables, roles and row-level security policies.
+    return sync_url(get_settings().migrations_url).render_as_string(hide_password=False)
 
 
 def run_migrations_offline() -> None:

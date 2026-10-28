@@ -14,7 +14,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, make_url, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -22,6 +22,8 @@ from app.api.deps import get_current_user
 from app.api.routes.chat import get_answer_generator
 from app.api.routes.search import get_retriever
 from app.core.config import Settings, get_settings
+from app.core.ratelimit import MemoryRateLimiter, get_rate_limiter
+from app.db.access import RlsContext, rls_session_info
 from app.db.base import Base
 from app.db.models import EMBEDDING_DIM, Role, Tenant, User
 from app.db.session import get_async_sessionmaker, get_db, sync_url
@@ -76,8 +78,8 @@ def postgres_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str | Non
         conn.execute(text("CREATE SCHEMA public"))
     engine.dispose()
 
-    previous = os.environ.get("DATABASE_URL")
-    os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+    previous = os.environ.get("MIGRATION_DATABASE_URL")
+    os.environ["MIGRATION_DATABASE_URL"] = TEST_DATABASE_URL
     get_settings.cache_clear()
     try:
         config = Config(str(BACKEND_DIR / "alembic.ini"))
@@ -86,11 +88,18 @@ def postgres_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str | Non
         command.upgrade(config, "head")
     finally:
         if previous is None:
-            os.environ.pop("DATABASE_URL", None)
+            os.environ.pop("MIGRATION_DATABASE_URL", None)
         else:
-            os.environ["DATABASE_URL"] = previous
+            os.environ["MIGRATION_DATABASE_URL"] = previous
         get_settings.cache_clear()
     yield TEST_DATABASE_URL
+
+
+def app_role_url(owner_url: str) -> str:
+    """The same database as the unprivileged `rag_app` role, so row-level security applies."""
+    password = Settings(_env_file=None).app_db_password.get_secret_value()  # type: ignore[call-arg]
+    url = make_url(owner_url).set(username="rag_app", password=password)
+    return url.render_as_string(hide_password=False)
 
 
 @pytest.fixture
@@ -100,7 +109,12 @@ def settings(tmp_path: Path, postgres_url: str | None) -> Settings:
         env="test",
         log_json=False,
         log_level="WARNING",
-        database_url=postgres_url or f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}",
+        database_url=(
+            app_role_url(postgres_url)
+            if postgres_url
+            else f"sqlite+aiosqlite:///{(tmp_path / 'test.db').as_posix()}"
+        ),
+        migration_database_url=postgres_url,
         storage_dir=tmp_path / "storage",
         max_upload_bytes=1024 * 1024,
     )
@@ -113,14 +127,17 @@ def storage(settings: Settings) -> LocalStorage:
 
 @pytest.fixture
 def sync_sessions(settings: Settings, postgres_url: str | None) -> Iterator[sessionmaker[Session]]:
+    """Sessions like the ingestion worker's: the app role with system RLS scope."""
     engine = create_engine(sync_url(settings.database_url))
     if postgres_url:
+        owner = create_engine(sync_url(postgres_url))
         tables = ", ".join(t.name for t in Base.metadata.sorted_tables)
-        with engine.begin() as conn:
+        with owner.begin() as conn:
             conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
+        owner.dispose()
     else:
         Base.metadata.create_all(engine)
-    yield sessionmaker(engine, expire_on_commit=False)
+    yield sessionmaker(engine, expire_on_commit=False, info=rls_session_info(RlsContext.system()))
     engine.dispose()
 
 
@@ -317,6 +334,7 @@ def app(
     reranker: FakeReranker,
     retrieval_config: RetrievalConfig,
     answer_generator: FakeAnswerGenerator,
+    rate_limiter: MemoryRateLimiter,
     async_sessions: async_sessionmaker[AsyncSession],
 ) -> FastAPI:
     """The API with test doubles. Tests may change `app.dependency_overrides` at any time."""
@@ -346,9 +364,15 @@ def app(
             get_current_user: _user,
             get_retriever: lambda: retriever,
             get_answer_generator: lambda: answer_generator,
+            get_rate_limiter: lambda: rate_limiter,
         }
     )
     return application
+
+
+@pytest.fixture
+def rate_limiter() -> MemoryRateLimiter:
+    return MemoryRateLimiter()
 
 
 @pytest.fixture

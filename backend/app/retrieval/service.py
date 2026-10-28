@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
-from app.db.access import Principal
+from app.db.access import Principal, RlsContext, set_rls_async
 from app.db.models import Chunk, Document
 from app.embeddings import EmbeddingError, EmbeddingProvider
 from app.ingestion.chunking import with_source_header
@@ -111,6 +111,8 @@ class HybridRetriever:
     ) -> SearchResult:
         cfg = config or self.config
         filters = filters or SearchFilters()
+        # Every session is scoped to this user for Postgres row-level security as well.
+        rls = RlsContext.for_principal(principal)
         timings: dict[str, float] = {}
         degraded: list[str] = []
         embedding_model: list[str] = []
@@ -118,6 +120,7 @@ class HybridRetriever:
 
         async def run_keyword() -> list[RankedChunk]:
             async with self._sessions() as session:
+                await set_rls_async(session, rls)
                 return await _timed(
                     timings,
                     "keyword",
@@ -140,6 +143,7 @@ class HybridRetriever:
                 return []
             embedding_model.append(provider.model_name)
             async with self._sessions() as session:
+                await set_rls_async(session, rls)
                 return await _timed(
                     timings,
                     "vector",
@@ -170,7 +174,7 @@ class HybridRetriever:
         )
         pool = max(top_k, cfg.rerank_candidates) if rerank else top_k
         hits = await _timed(
-            timings, "hydrate", self._hydrate(fused, pool, collapse=collapse_duplicates)
+            timings, "hydrate", self._hydrate(fused, pool, rls, collapse=collapse_duplicates)
         )
         reranked = await self._rerank(query, hits, timings, degraded) if rerank and hits else None
         hits = hits[:top_k]
@@ -251,13 +255,14 @@ class HybridRetriever:
         return _Reranked(reranker.model_name, result.tokens, round(cost, 6))
 
     async def _hydrate(
-        self, fused: list[FusedChunk], top_k: int, *, collapse: bool
+        self, fused: list[FusedChunk], top_k: int, rls: RlsContext, *, collapse: bool
     ) -> list[SearchHit]:
         """Load chunk and document details, collapsing chunks with identical text."""
         if not fused:
             return []
         ids = [f.chunk_id for f in fused]
         async with self._sessions() as session:
+            await set_rls_async(session, rls)
             rows = await session.execute(
                 select(
                     Chunk.id,

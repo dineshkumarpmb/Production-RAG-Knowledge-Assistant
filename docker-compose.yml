@@ -27,7 +27,12 @@ x-backend: &backend
   <<: *image
   environment:
     <<: *settings
-    DATABASE_URL: postgresql+psycopg://rag:rag@postgres:5432/rag
+    # The app runs as `rag_app` so Postgres row-level security applies; migrations run as the
+    # owner. Both roles live only inside this local stack.
+    DATABASE_URL: postgresql+psycopg://rag_app:${APP_DB_PASSWORD:-rag_app}@postgres:5432/rag
+    MIGRATION_DATABASE_URL: postgresql+psycopg://rag:rag@postgres:5432/rag
+    APP_DB_PASSWORD: ${APP_DB_PASSWORD:-rag_app}
+    JWT_SECRET: ${JWT_SECRET:-dev-only-insecure-jwt-secret-change-me}
     REDIS_URL: redis://redis:6379/0
     STORAGE_DIR: /data/uploads
     MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
